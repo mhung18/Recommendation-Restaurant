@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import itertools
+import re
 
 from Content_based_Filtering_model import (
     load_and_prepare_data,
@@ -35,6 +36,16 @@ def load_full_data():
         data = json.load(f)
     return pd.DataFrame(data)
 
+def district_sort_key(name):
+    if name.startswith("Quận"):
+        match = re.search(r"\d+", name)
+        if match:
+            return (0, int(match.group()))
+        else:
+            return (0, 999)  # fallback nếu có Quận nhưng không có số
+    else:
+        return (1, name)
+
 
 X, cosine_sim = load_data()
 full_df = load_full_data()  # DataFrame đầy đủ có lat/lon
@@ -45,7 +56,8 @@ full_df = load_full_data()  # DataFrame đầy đủ có lat/lon
 st.sidebar.header("🔍 Bộ lọc")
 
 districts = ["Tất cả"] + sorted(
-    X[X["district"].notna()]["district"].unique().tolist()
+    X[X["district"].notna()]["district"].unique().tolist(),
+    key=district_sort_key
 )
 
 # flatten food_categories
