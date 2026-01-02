@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -139,10 +140,6 @@ def add_to_history(restaurant_id, action="viewed"):
     # Convert sang int chuẩn (tránh int64 từ pandas)
     restaurant_id = int(restaurant_id)
 
-    # Debug log
-    print(f"[DEBUG] Adding restaurant ID: {restaurant_id}, Action: {action}")
-    print(f"[DEBUG] Current liked: {prefs.get('liked_restaurants', [])}")
-
     if action == "viewed":
         if restaurant_id not in prefs["viewed_restaurants"]:
             prefs["viewed_restaurants"].append(restaurant_id)
@@ -152,16 +149,22 @@ def add_to_history(restaurant_id, action="viewed"):
     elif action == "liked":
         if restaurant_id not in prefs["liked_restaurants"]:
             prefs["liked_restaurants"].append(restaurant_id)
-            print(f"[DEBUG] Added {restaurant_id} to liked")
-            print(f"[DEBUG] New liked list: {prefs['liked_restaurants']}")
             # Đồng thời xóa khỏi viewed nếu có
             if restaurant_id in prefs["viewed_restaurants"]:
                 prefs["viewed_restaurants"].remove(restaurant_id)
 
-    # Lưu và return True/False
-    result = save_user_preferences(prefs)
-    print(f"[DEBUG] Save result: {result}")
-    return result
+    return save_user_preferences(prefs)
+
+
+def district_sort_key(name):
+    if name.startswith("Quận"):
+        match = re.search(r"\d+", name)
+        if match:
+            return (0, int(match.group()))
+        else:
+            return (0, 999)  # fallback nếu có Quận nhưng không có số
+    else:
+        return (1, name)
 
 
 # ----------------------
@@ -170,32 +173,25 @@ def add_to_history(restaurant_id, action="viewed"):
 def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=12, cf_weight=0.4, cb_weight=0.6):
     """
     Hybrid Recommendation: 40% CF + 60% CB
-
-    Args:
-        user_prefs: User preferences
-        X: Processed data for CB
-        full_df: Full restaurant data
-        cosine_sim: Similarity matrix for CB
-        cf_model: Collaborative Filtering model
-        n: Number of recommendations
-        cf_weight: Weight for CF (default 0.4)
-        cb_weight: Weight for CB (default 0.6)
-
-    Returns:
-        List of recommendations with hybrid scores
     """
     hybrid_scores = {}
+
+    print(f"[DEBUG] CF Model trained: {cf_model.is_trained}")
 
     # ==================
     # 1. GET CF RECOMMENDATIONS (40%)
     # ==================
     if cf_model.is_trained:
+        print("[DEBUG] Getting CF recommendations...")
         cf_recs = cf_model.get_recommendations('current_user', n=n * 2)
+        print(f"[DEBUG] CF returned {len(cf_recs)} recommendations")
 
         # Normalize CF scores to 0-1
         if cf_recs:
             max_cf_score = max([score for _, score in cf_recs])
             min_cf_score = min([score for _, score in cf_recs])
+
+            print(f"[DEBUG] CF score range: {min_cf_score:.3f} - {max_cf_score:.3f}")
 
             if max_cf_score > min_cf_score:
                 for res_id, score in cf_recs:
@@ -206,17 +202,24 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                         'reason_cf': 'Dựa trên sở thích người dùng tương tự',
                         'type': 'cf'
                     }
+                    print(f"[DEBUG] CF: Restaurant {res_id}, score: {normalized_score:.3f}")
+    else:
+        print("[DEBUG] CF Model not trained - skipping CF recommendations")
 
     # ==================
     # 2. GET CB RECOMMENDATIONS (60%)
     # ==================
     cb_candidates = []
 
+    print(f"[DEBUG] Getting CB recommendations...")
+    print(f"[DEBUG] User liked restaurants: {user_prefs['liked_restaurants']}")
+
     # Strategy A: Content-Based từ quán đã thích
     if user_prefs["liked_restaurants"]:
         for rest_id in user_prefs["liked_restaurants"][-3:]:
             if rest_id in X.index:
                 similar = recommend_restaurants(rest_id, X, cosine_sim, n=10)
+                print(f"[DEBUG] CB from liked {rest_id}: found {len(similar)} similar")
                 for idx in similar:
                     if idx not in user_prefs["viewed_restaurants"]:
                         cb_candidates.append({
@@ -253,6 +256,8 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                 'reason': f"Đánh giá cao ({row['average_rating']}/10)"
             })
 
+    print(f"[DEBUG] CB candidates: {len(cb_candidates)}")
+
     # Normalize CB scores
     for candidate in cb_candidates:
         res_id = candidate['id']
@@ -269,6 +274,11 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                 'reason_cb': candidate['reason'],
                 'type': 'cb'
             }
+
+    print(f"[DEBUG] Total hybrid scores: {len(hybrid_scores)}")
+    print(f"[DEBUG] Types: CF={sum(1 for s in hybrid_scores.values() if s['type'] == 'cf')}, "
+          f"CB={sum(1 for s in hybrid_scores.values() if s['type'] == 'cb')}, "
+          f"Hybrid={sum(1 for s in hybrid_scores.values() if s['type'] == 'hybrid')}")
 
     # ==================
     # 3. CALCULATE HYBRID SCORES
@@ -331,7 +341,10 @@ selected_categories = st.sidebar.multiselect(
 )
 
 # Districts preference
-all_districts = sorted(X['district'].unique().tolist())
+all_districts = sorted(
+    X['district'].dropna().unique().tolist(),
+    key=district_sort_key
+)
 selected_districts = st.sidebar.multiselect(
     "📍 Khu vực quan tâm",
     options=all_districts,
@@ -358,20 +371,6 @@ if st.sidebar.button("💾 Lưu sở thích", type="primary", use_container_widt
     if save_user_preferences(user_prefs):
         st.sidebar.success("✅ Đã lưu sở thích!")
         st.rerun()
-
-# Debug info ở sidebar
-with st.sidebar.expander("🔧 Debug Info"):
-    st.write("**File paths:**")
-    st.code(f"USER_PREFS_FILE: {os.path.abspath(USER_PREFS_FILE)}")
-    st.write(f"File exists: {os.path.exists(USER_PREFS_FILE)}")
-
-    if os.path.exists(USER_PREFS_FILE):
-        st.write(f"File size: {os.path.getsize(USER_PREFS_FILE)} bytes")
-        st.write(f"Readable: {os.access(USER_PREFS_FILE, os.R_OK)}")
-        st.write(f"Writable: {os.access(USER_PREFS_FILE, os.W_OK)}")
-
-    st.write(f"Current dir: {os.getcwd()}")
-    st.write(f"Dir writable: {os.access('.', os.W_OK)}")
 
 # Stats
 st.sidebar.write("---")
@@ -411,6 +410,14 @@ with st.spinner("🔍 Đang tìm kiếm gợi ý cho bạn..."):
         user_prefs, X, full_df, cosine_sim, cf_model, n=12
     )
 
+# Debug: Show recommendation sources
+if recommendations:
+    cf_count = sum(1 for r in recommendations if r['type'] in ['cf', 'hybrid'])
+    cb_count = sum(1 for r in recommendations if r['type'] == 'cb')
+    hybrid_count = sum(1 for r in recommendations if r['type'] == 'hybrid')
+
+    st.caption(f"📊 Nguồn gợi ý: {cf_count} CF, {cb_count} CB, {hybrid_count} Hybrid")
+
 # ----------------------
 # DISPLAY RECOMMENDATIONS
 # ----------------------
@@ -430,7 +437,7 @@ else:
         st.subheader(f"🎯 {len(recommendations)} gợi ý dành cho bạn")
     with col_info:
         if cf_model.is_trained:
-            st.success("🤖 Hybrid: 40% CF + 60% CB")
+            st.success("🤖 Using Hybrid Model")
         else:
             st.info("🎯 Content-Based Only")
 
@@ -490,7 +497,7 @@ else:
                                 # Lưu tên quán vào session state để trang chi tiết hiển thị
                                 st.session_state.selected_restaurant = rest_name
                                 # Chuyển trang (cần đúng tên file)
-                                st.switch_page("pages/Detail_place.py")
+                                st.switch_page("pages/Detail_Place.py")
 
                         with col_btn2:
                             is_liked = rest_id in user_prefs.get("liked_restaurants", [])
