@@ -1,0 +1,20 @@
+{
+  "1124": [
+    {
+      "id": 1,
+      "rating": 8,
+      "comment": "Bò né ngon nha",
+      "user": "Hùng",
+      "timestamp": "01/01/2026 02:03"
+    }
+  ],
+  "25": [
+    {
+      "id": 1,
+      "rating": 8,
+      "comment": "Món ngon vãiii",
+      "user": "Hoàn",
+      "timestamp": "02/01/2026 10:05"
+    }
+  ]
+}
