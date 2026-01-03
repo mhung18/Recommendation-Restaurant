@@ -3,6 +3,17 @@ import pandas as pd
 import json
 from datetime import datetime
 import os
+import time as time_module
+import pydeck as pdk
+
+
+# Import comment analyzer
+try:
+    from comment_analyzer import update_user_preferences
+
+    ANALYZER_AVAILABLE = True
+except:
+    ANALYZER_AVAILABLE = False
 
 st.set_page_config(page_title="Chi tiết địa điểm", page_icon="📍", layout="wide")
 
@@ -143,9 +154,12 @@ if not st.session_state.selected_restaurant:
                 st.write(f"⭐ Đánh giá: **{row['average_rating']}/10**")
 
                 # Hiển thị số lượng comment
-                comment_count = len(get_restaurant_comments(row['id']))
-                if comment_count > 0:
-                    st.caption(f"💬 {comment_count} bình luận")
+                user_comment_count = len(get_restaurant_comments(row['id']))
+                foody_review_count = len(get_foody_reviews_by_restaurant(row['id']))
+                total_count = user_comment_count + foody_review_count
+
+                if total_count > 0:
+                    st.caption(f"💬 {total_count} đánh giá")
 
                 if st.button("Xem chi tiết", key=f"btn_{idx}"):
                     st.session_state.selected_restaurant = row['name']
@@ -186,15 +200,55 @@ else:
         """)
 
         # ----------------------
-        # MAP (nếu có tọa độ)
+        # MAP 
         # ----------------------
         if pd.notna(restaurant['latitude']) and pd.notna(restaurant['longitude']):
             st.subheader("🗺️ Vị trí")
-            map_data = pd.DataFrame({
-                'lat': [restaurant['latitude']],
-                'lon': [restaurant['longitude']]
+
+            map_df = pd.DataFrame({
+                "name": [restaurant["name"]],
+                "address": [restaurant["address"]],
+                "latitude": [restaurant["latitude"]],
+                "longitude": [restaurant["longitude"]]
             })
-            st.map(map_data, zoom=15)
+
+            layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=map_df,
+                get_position='[longitude, latitude]',
+                get_radius=120,
+                get_fill_color=[255, 59, 48],  # 🔴 đỏ kiểu Google Maps
+                pickable=True,
+                auto_highlight=True
+            )
+
+            view_state = pdk.ViewState(
+                latitude=restaurant["latitude"],
+                longitude=restaurant["longitude"],
+                zoom=15
+            )
+
+            tooltip = {
+                "html": """
+                <b>{name}</b><br/>
+                📍 {address}
+                """,
+                "style": {
+                    "backgroundColor": "white",
+                    "color": "black",
+                    "fontSize": "13px"
+                }
+            }
+
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=view_state,
+                    tooltip=tooltip,
+                    map_style="mapbox://styles/mapbox/streets-v11"
+                ),
+                use_container_width=True
+            )
 
     with col2:
         # ----------------------
@@ -245,16 +299,13 @@ else:
     # ----------------------
     # SUITABLE FOR
     # ----------------------
-    appropriate = restaurant.get("appropriate")
+    st.write("---")
+    st.subheader("👥 Phù hợp với")
 
-    if isinstance(appropriate, list) and len(appropriate) > 0:
-        st.write("---")
-        st.subheader("👥 Phù hợp với")
-
-        appropriate_cols = st.columns(len(appropriate))
-        for idx, app in enumerate(appropriate):
-            with appropriate_cols[idx]:
-                st.info(app)
+    appropriate_cols = st.columns(len(restaurant['appropriate']))
+    for idx, app in enumerate(restaurant['appropriate']):
+        with appropriate_cols[idx]:
+            st.info(app)
 
     # ----------------------
     # USER RATING SECTION
@@ -285,10 +336,31 @@ else:
             elif not comment_text.strip():
                 st.error("⚠️ Vui lòng nhập bình luận")
             else:
-                if add_comment(restaurant['id'], rating, comment_text.strip(), user_name.strip()):
-                    st.success("✅ Cảm ơn bạn đã đánh giá!")
-                    st.balloons()
-                    st.rerun()
+                with st.spinner("Đang lưu đánh giá..."):
+                    # Lưu comment
+                    success = add_comment(restaurant['id'], rating, comment_text.strip(), user_name.strip())
+
+                    if success:
+                        st.success("✅ Cảm ơn bạn đã đánh giá!")
+
+                        # Tự động phân tích comment
+                        if ANALYZER_AVAILABLE:
+                            try:
+                                # Run analyzer (silent mode)
+                                updated_prefs, _ = update_user_preferences(silent=True)
+
+                                # Hiển thị thông báo nếu có thay đổi
+                                if updated_prefs:
+                                    st.info("💡 Hệ thống đã học được sở thích của bạn từ đánh giá này!")
+                            except Exception as e:
+                                # Silent fail - không làm gián đoạn UX
+                                pass
+
+                        st.balloons()
+                        time_module.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Lỗi khi lưu đánh giá. Vui lòng thử lại!")
 
     # ----------------------
     # DISPLAY COMMENTS
