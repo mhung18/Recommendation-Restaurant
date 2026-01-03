@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-import re
 import time
+import re
 from datetime import datetime
 
 from Content_based_Filtering_model import (
@@ -12,6 +12,7 @@ from Content_based_Filtering_model import (
     recommend_restaurants
 )
 from Collaborative_Filtering_model import load_cf_model
+from comment_analyzer import update_user_preferences, get_analysis_summary
 
 st.set_page_config(
     page_title="Hôm nay ăn gì?",
@@ -48,6 +49,15 @@ def load_full_data():
 X, cosine_sim = load_data()
 cf_model = load_cf()
 full_df = load_full_data()
+
+def district_sort_key(name):
+    if name.startswith("Quận"):
+        match = re.search(r"\d+", name)
+        if match:
+            return (0, int(match.group()))
+        else:
+            return (0, 999)
+    return (1, name)
 
 # ----------------------
 # USER PREFERENCE FUNCTIONS
@@ -156,42 +166,26 @@ def add_to_history(restaurant_id, action="viewed"):
     return save_user_preferences(prefs)
 
 
-def district_sort_key(name):
-    if name.startswith("Quận"):
-        match = re.search(r"\d+", name)
-        if match:
-            return (0, int(match.group()))
-        else:
-            return (0, 999)  # fallback nếu có Quận nhưng không có số
-    else:
-        return (1, name)
-
-
 # ----------------------
 # HYBRID RECOMMENDATION ENGINE
 # ----------------------
 def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=12, cf_weight=0.4, cb_weight=0.6):
     """
     Hybrid Recommendation: 40% CF + 60% CB
+    Ưu tiên quán ở các quận trong favorite_districts
     """
     hybrid_scores = {}
-
-    print(f"[DEBUG] CF Model trained: {cf_model.is_trained}")
 
     # ==================
     # 1. GET CF RECOMMENDATIONS (40%)
     # ==================
     if cf_model.is_trained:
-        print("[DEBUG] Getting CF recommendations...")
         cf_recs = cf_model.get_recommendations('current_user', n=n * 2)
-        print(f"[DEBUG] CF returned {len(cf_recs)} recommendations")
 
         # Normalize CF scores to 0-1
         if cf_recs:
             max_cf_score = max([score for _, score in cf_recs])
             min_cf_score = min([score for _, score in cf_recs])
-
-            print(f"[DEBUG] CF score range: {min_cf_score:.3f} - {max_cf_score:.3f}")
 
             if max_cf_score > min_cf_score:
                 for res_id, score in cf_recs:
@@ -202,24 +196,17 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                         'reason_cf': 'Dựa trên sở thích người dùng tương tự',
                         'type': 'cf'
                     }
-                    print(f"[DEBUG] CF: Restaurant {res_id}, score: {normalized_score:.3f}")
-    else:
-        print("[DEBUG] CF Model not trained - skipping CF recommendations")
 
     # ==================
     # 2. GET CB RECOMMENDATIONS (60%)
     # ==================
     cb_candidates = []
 
-    print(f"[DEBUG] Getting CB recommendations...")
-    print(f"[DEBUG] User liked restaurants: {user_prefs['liked_restaurants']}")
-
     # Strategy A: Content-Based từ quán đã thích
     if user_prefs["liked_restaurants"]:
         for rest_id in user_prefs["liked_restaurants"][-3:]:
             if rest_id in X.index:
                 similar = recommend_restaurants(rest_id, X, cosine_sim, n=10)
-                print(f"[DEBUG] CB from liked {rest_id}: found {len(similar)} similar")
                 for idx in similar:
                     if idx not in user_prefs["viewed_restaurants"]:
                         cb_candidates.append({
@@ -228,7 +215,7 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                             'reason': f"Tương tự quán bạn đã thích"
                         })
 
-    # Strategy B: Filter theo sở thích
+    # Strategy B: Filter theo sở thích + ƯU TIÊN QUẬN
     if user_prefs["favorite_categories"]:
         filtered_df = full_df[
             full_df['food_categories'].apply(
@@ -236,27 +223,67 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
             )
         ]
 
-        for idx, row in filtered_df.head(15).iterrows():
+        # Ưu tiên quán ở favorite_districts trước
+        if user_prefs["favorite_districts"]:
+            # Quán ở quận yêu thích
+            priority_df = filtered_df[filtered_df['district'].isin(user_prefs["favorite_districts"])]
+
+            for idx, row in priority_df.head(15).iterrows():
+                if idx not in user_prefs["viewed_restaurants"]:
+                    matched_cats = [cat for cat in row['food_categories']
+                                    if cat in user_prefs["favorite_categories"]]
+                    cb_candidates.append({
+                        'id': idx,
+                        'score': 0.90,  # Score cao hơn vì ở quận yêu thích
+                        'reason': f"Phù hợp: {', '.join(matched_cats[:2])} tại {row['district']}"
+                    })
+
+            # Quán ở quận khác (điểm thấp hơn)
+            other_df = filtered_df[~filtered_df['district'].isin(user_prefs["favorite_districts"])]
+            for idx, row in other_df.head(10).iterrows():
+                if idx not in user_prefs["viewed_restaurants"]:
+                    matched_cats = [cat for cat in row['food_categories']
+                                    if cat in user_prefs["favorite_categories"]]
+                    cb_candidates.append({
+                        'id': idx,
+                        'score': 0.75,  # Score thấp hơn
+                        'reason': f"Phù hợp: {', '.join(matched_cats[:2])}"
+                    })
+        else:
+            # Không có district preference → xử lý bình thường
+            for idx, row in filtered_df.head(15).iterrows():
+                if idx not in user_prefs["viewed_restaurants"]:
+                    matched_cats = [cat for cat in row['food_categories']
+                                    if cat in user_prefs["favorite_categories"]]
+                    cb_candidates.append({
+                        'id': idx,
+                        'score': 0.85,
+                        'reason': f"Phù hợp với sở thích: {', '.join(matched_cats[:2])}"
+                    })
+
+    # Strategy C: Filter theo QUẬN trước (nếu có)
+    if user_prefs["favorite_districts"]:
+        district_df = full_df[full_df['district'].isin(user_prefs["favorite_districts"])]
+
+        # Lấy top rated ở quận yêu thích
+        top_in_district = district_df.nlargest(10, 'average_rating')
+        for idx, row in top_in_district.iterrows():
             if idx not in user_prefs["viewed_restaurants"]:
-                matched_cats = [cat for cat in row['food_categories']
-                                if cat in user_prefs["favorite_categories"]]
                 cb_candidates.append({
                     'id': idx,
-                    'score': 0.85,
-                    'reason': f"Phù hợp với sở thích: {', '.join(matched_cats[:2])}"
+                    'score': 0.80,  # Score cao vì ở quận yêu thích
+                    'reason': f"Đánh giá cao tại {row['district']} ({row['average_rating']}/10)"
                 })
 
-    # Strategy C: Top rated
+    # Strategy D: Top rated (điểm thấp nhất)
     top_rated = full_df.nlargest(15, 'average_rating')
     for idx, row in top_rated.iterrows():
         if idx not in user_prefs["viewed_restaurants"]:
             cb_candidates.append({
                 'id': idx,
-                'score': 0.75,
+                'score': 0.70,
                 'reason': f"Đánh giá cao ({row['average_rating']}/10)"
             })
-
-    print(f"[DEBUG] CB candidates: {len(cb_candidates)}")
 
     # Normalize CB scores
     for candidate in cb_candidates:
@@ -275,11 +302,6 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
                 'type': 'cb'
             }
 
-    print(f"[DEBUG] Total hybrid scores: {len(hybrid_scores)}")
-    print(f"[DEBUG] Types: CF={sum(1 for s in hybrid_scores.values() if s['type'] == 'cf')}, "
-          f"CB={sum(1 for s in hybrid_scores.values() if s['type'] == 'cb')}, "
-          f"Hybrid={sum(1 for s in hybrid_scores.values() if s['type'] == 'hybrid')}")
-
     # ==================
     # 3. CALCULATE HYBRID SCORES
     # ==================
@@ -293,6 +315,10 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
 
         # Tính tổng điểm
         total_score = scores['cf_score'] + scores['cb_score']
+
+        # BONUS: Thêm điểm nếu quán ở favorite_districts
+        if user_prefs["favorite_districts"] and restaurant['district'] in user_prefs["favorite_districts"]:
+            total_score += 0.1  # Bonus 10%
 
         # Tạo reason message
         if scores['type'] == 'hybrid':
@@ -311,7 +337,7 @@ def get_hybrid_recommendations(user_prefs, X, full_df, cosine_sim, cf_model, n=1
             'type': scores['type']
         })
 
-    # Sort theo hybrid score
+    # Sort theo hybrid score (bao gồm bonus)
     recommendations.sort(key=lambda x: x['score'], reverse=True)
 
     return recommendations[:n]
@@ -341,10 +367,7 @@ selected_categories = st.sidebar.multiselect(
 )
 
 # Districts preference
-all_districts = sorted(
-    X['district'].dropna().unique().tolist(),
-    key=district_sort_key
-)
+all_districts = sorted(X['district'].unique().tolist(), key=district_sort_key)
 selected_districts = st.sidebar.multiselect(
     "📍 Khu vực quan tâm",
     options=all_districts,
@@ -372,6 +395,42 @@ if st.sidebar.button("💾 Lưu sở thích", type="primary", use_container_widt
         st.sidebar.success("✅ Đã lưu sở thích!")
         st.rerun()
 
+# # Auto-analyze comments button
+# st.sidebar.write("---")
+# if st.sidebar.button("🤖 Phân tích Comments tự động", use_container_width=True):
+#     with st.sidebar.spinner("Đang phân tích..."):
+#         try:
+#             updated_prefs, all_user_prefs = update_user_preferences()
+#
+#             st.sidebar.success("✅ Phân tích thành công!")
+#
+#             # Show summary
+#             with st.sidebar.expander("📊 Kết quả phân tích"):
+#                 st.write(f"**Categories mới:** {len(updated_prefs['favorite_categories'])}")
+#                 st.write(f"**Districts mới:** {len(updated_prefs['favorite_districts'])}")
+#                 st.write(f"**Liked restaurants:** {len(updated_prefs['liked_restaurants'])}")
+#
+#             # Clear cache và reload
+#             st.cache_data.clear()
+#             st.cache_resource.clear()
+#             time.sleep(1)
+#             st.rerun()
+#
+#         except Exception as e:
+#             st.sidebar.error(f"❌ Lỗi: {str(e)}")
+#
+# # Debug info ở sidebar (có thể ẩn khi production)
+# if st.sidebar.checkbox("🔧 Hiển thị thông tin kỹ thuật", value=False):
+#     with st.sidebar.expander("Debug Info"):
+#         st.write("**File paths:**")
+#         st.code(f"USER_PREFS_FILE: {os.path.abspath(USER_PREFS_FILE)}")
+#         st.write(f"File exists: {os.path.exists(USER_PREFS_FILE)}")
+#
+#         if os.path.exists(USER_PREFS_FILE):
+#             st.write(f"File size: {os.path.getsize(USER_PREFS_FILE)} bytes")
+#
+#         st.write(f"Current dir: {os.getcwd()}")
+
 # Stats
 st.sidebar.write("---")
 st.sidebar.write("📊 **Thống kê của bạn:**")
@@ -392,15 +451,12 @@ if current_prefs.get("liked_restaurants"):
     with st.sidebar.expander("❤️ Quán đã thích"):
         for res_id in current_prefs["liked_restaurants"]:
             try:
-                # Tìm restaurant theo ID
                 matching = full_df[full_df['id'] == res_id]
                 if not matching.empty:
                     restaurant_name = matching.iloc[0]['name']
-                    st.write(f"• {restaurant_name} (ID: {res_id})")
-                else:
-                    st.write(f"• ID: {res_id} (không tìm thấy)")
+                    st.write(f"• {restaurant_name}")
             except:
-                st.write(f"• ID: {res_id}")
+                pass
 
 # ----------------------
 # GET RECOMMENDATIONS
@@ -409,14 +465,6 @@ with st.spinner("🔍 Đang tìm kiếm gợi ý cho bạn..."):
     recommendations = get_hybrid_recommendations(
         user_prefs, X, full_df, cosine_sim, cf_model, n=12
     )
-
-# Debug: Show recommendation sources
-if recommendations:
-    cf_count = sum(1 for r in recommendations if r['type'] in ['cf', 'hybrid'])
-    cb_count = sum(1 for r in recommendations if r['type'] == 'cb')
-    hybrid_count = sum(1 for r in recommendations if r['type'] == 'hybrid')
-
-    st.caption(f"📊 Nguồn gợi ý: {cf_count} CF, {cb_count} CB, {hybrid_count} Hybrid")
 
 # ----------------------
 # DISPLAY RECOMMENDATIONS
@@ -437,7 +485,7 @@ else:
         st.subheader(f"🎯 {len(recommendations)} gợi ý dành cho bạn")
     with col_info:
         if cf_model.is_trained:
-            st.success("🤖 Using Hybrid Model")
+            st.success("🤖 Hybrid: 40% CF + 60% CB")
         else:
             st.info("🎯 Content-Based Only")
 
@@ -474,15 +522,8 @@ else:
                         categories_str = ", ".join(restaurant['food_categories'][:3])
                         st.caption(f"🍜 {categories_str}")
 
-                        # Reason with score breakdown
+                        # Reason
                         st.info(f"💡 {rec['reason']}")
-
-                        # Score breakdown (optional, for debugging)
-                        if rec['type'] == 'hybrid':
-                            with st.expander("📊 Chi tiết điểm"):
-                                st.write(f"CF Score: {rec['cf_score']:.2f} (40%)")
-                                st.write(f"CB Score: {rec['cb_score']:.2f} (60%)")
-                                st.write(f"Total: {rec['score']:.2f}")
 
                         # Actions
                         col_btn1, col_btn2 = st.columns(2)
@@ -506,15 +547,10 @@ else:
                             if st.button(like_label, key=f"like_{rest_id}_{i}_{j}", use_container_width=True,
                                          disabled=is_liked):
                                 if not is_liked:
-                                    # Debug: Show which restaurant is being liked
-                                    with st.spinner(f"Đang thêm '{rest_name}' (ID: {rest_id}) vào yêu thích..."):
-                                        success = add_to_history(rest_id, "liked")
-
+                                    success = add_to_history(rest_id, "liked")
                                     if success:
-                                        # Clear cache để reload CF model với data mới
                                         st.cache_resource.clear()
                                         st.cache_data.clear()
-                                        # Reload trang
                                         st.rerun()
                                     else:
                                         st.error("❌ Lỗi khi lưu. Vui lòng thử lại!")
